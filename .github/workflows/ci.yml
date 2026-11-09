@@ -28,10 +28,13 @@ jobs:
         run: python scripts/check_version.py
       - name: Lint (syntax + bugbear + async blocking)
         run: ruff check core executor gateway scripts tests
-      - name: Type check (advisory, non-blocking)
-        run: mypy core executor gateway || true
+      # 全仓强制：126 个历史错误已全部清零，不再需要 advisory 兜底。
+      - name: Type check (blocking)
+        run: mypy core executor gateway
       - name: Tests + coverage gate
         run: pytest -q --cov=core --cov-report=term --cov-fail-under=70
+      - name: Harness (offline: persona consistency, version, emote tags)
+        run: python scripts/harness_all.py
       - name: Dependency audit (production deps)
         run: pip-audit -r requirements.txt -s osv
 

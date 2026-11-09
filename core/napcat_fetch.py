@@ -20,10 +20,29 @@ from collections.abc import Callable
 
 import httpx
 
-PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
-    or "http://127.0.0.1:7897"
+
+def _proxy() -> str | None:
+    """代理地址，**只在显式配置时使用**。
+
+    此前默认写死 ``http://127.0.0.1:7897``（Clash 的常见端口）。后果是：
+    没开代理的机器每一块都 ConnectError（WinError 10061 连接被拒绝），
+    六路并发一起失败，下载直接卡死——而真正的原因「本机没跑代理」
+    完全看不出来，用户只会以为网坏了（本轮实测复现）。
+
+    正确的默认是**不用代理**：httpx 默认会读 HTTP(S)_PROXY 环境变量，
+    用户自己有代理时照常生效；显式设 NAPCAT_DL_PROXY 才强制走代理。
+    """
+    explicit = (os.environ.get("NAPCAT_DL_PROXY") or "").strip()
+    if explicit:
+        return explicit
+    # 空字符串 = 不使用代理（显式关闭，避免继承到不可用的环境变量）
+    return None
+
+
 BLOCK = 512 * 1024
 IO_CHUNK = 64 * 1024
+# 连续多少轮零字节就判定下载停滞（每轮含 2s 退避，默认约 1 分钟）
+MAX_STALL_ROUNDS = int(os.environ.get("NAPCAT_DL_MAX_STALL_ROUNDS", "30"))
 MIRROR_PREFIXES = ["https://ghproxy.net/", "https://gh-proxy.com/", ""]
 
 
@@ -31,10 +50,21 @@ def _urls(direct: str) -> list[str]:
     return [p + direct for p in MIRROR_PREFIXES]
 
 
-def _download_part(index: int, urls: list[str], start: int, end: int, f: str) -> None:
-    """把 [start, end] 区间落进文件 f 的对应偏移（f 是分段文件，断点续传）。"""
+def _download_part(index: int, urls: list[str], start: int, end: int, f: str,
+                   max_stall: int = MAX_STALL_ROUNDS) -> None:
+    """把 [start, end] 区间落进文件 f 的对应偏移（f 是分段文件，断点续传）。
+
+    ``max_stall``：连续多少轮**一点字节都没收到**就放弃并抛错。
+
+    这条上限是必须的。此前 ``idle`` 计数到 6 只是打印一句「all mirrors
+    struggling」然后清零，循环永不退出——下载线程永远活着，
+    ``strict_download`` 的 ``thread.join()`` 永不返回，控制台部署向导就一直
+    停在「下载中…」，既不报错也没有超时提示，用户只能以为是自己网卡了。
+    慢速但持续有进展的下载不受影响：只有「连续零字节」才累计。
+    """
     url_i = 0
     idle = 0
+    last_error = "no mirror produced any bytes"
     while True:
         have = os.path.getsize(f) if os.path.exists(f) else 0
         a = start + have
@@ -44,7 +74,7 @@ def _download_part(index: int, urls: list[str], start: int, end: int, f: str) ->
         url = urls[url_i % len(urls)]
         got = 0
         try:
-            with httpx.Client(proxy=PROXY, timeout=45, follow_redirects=True) as c:
+            with httpx.Client(proxy=_proxy(), timeout=45, follow_redirects=True) as c:
                 with c.stream("GET", url, headers={"Range": f"bytes={a}-{a + want - 1}"}) as r:
                     if r.status_code != 206:
                         raise RuntimeError(f"status {r.status_code}")
@@ -53,15 +83,21 @@ def _download_part(index: int, urls: list[str], start: int, end: int, f: str) ->
                             fp.write(chunk)
                             got += len(chunk)
         except Exception as e:  # noqa: BLE001 - 网络失败靠重试与镜像轮换消化
-            print(f"  ! {type(e).__name__}: {str(e)[:60]} at +{got}", flush=True)
+            last_error = f"{type(e).__name__}: {str(e)[:80]}"
+            print(f"  ! {last_error} at +{got}", flush=True)
         if got == 0:
             idle += 1
             url_i += 1
+            if idle % 6 == 0:
+                print(f"  ! all mirrors struggling at offset {a} "
+                      f"({idle}/{max_stall})", flush=True)
             time.sleep(2)
+            if idle >= max_stall:
+                raise IOError(
+                    f"下载停滞：连续 {idle} 轮没有收到任何字节（区间 {a}-{end}）。"
+                    f"最后错误：{last_error}。可检查网络/代理 HTTPS_PROXY，或稍后重试（已收字节会保留）。"
+                )
         else:
-            idle = 0
-        if idle >= 6:
-            print(f"  ! all mirrors struggling at offset {a}", flush=True)
             idle = 0
 
 
@@ -71,6 +107,9 @@ def strict_download(url: str, target: int, out: str | Path, jobs: int = 6,
     """并行分段下载 url 到 out（合并后 CRC 校验）。返回 0=成功。
 
     progress: 回调当前已收字节数（0..target），每 20 秒或每段完成时调用。
+
+    线程里的异常会被收集后在主线程重抛：否则分段线程悄悄死掉，主线程只看得到
+    「size mismatch」，真正原因（406/403/代理不可达/停滞）就丢了。
     """
     import threading
 
@@ -78,11 +117,15 @@ def strict_download(url: str, target: int, out: str | Path, jobs: int = 6,
     urls = _urls(url)
     chunk = (target + jobs - 1) // jobs
     parts = [f"_dl_part_{i}" for i in range(jobs)]
+    errors: list[BaseException] = []
 
     def run(i: int) -> None:
         start = i * chunk
         end = min(start + chunk - 1, target - 1)
-        _download_part(i, urls, start, end, parts[i])
+        try:
+            _download_part(i, urls, start, end, parts[i])
+        except BaseException as e:  # noqa: BLE001 - 收集后在主线程重抛
+            errors.append(e)
 
     threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(jobs)]
     for t in threads:
@@ -96,6 +139,8 @@ def strict_download(url: str, target: int, out: str | Path, jobs: int = 6,
         time.sleep(2)
     for t in threads:
         t.join()
+    if errors:
+        raise IOError(f"下载失败：{errors[0]}") from errors[0]
     done = sum(os.path.getsize(p) for p in parts if os.path.exists(p))
     if progress:
         progress(done)

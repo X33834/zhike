@@ -54,6 +54,295 @@ no separate clones or manual installs.
 
 ---
 
+## [1.8.1] — 2026-11-09
+
+### Fixed
+
+- **`qr_code` leaked its input to a third party.** When the local `qrcode` package was missing,
+  the tool fell back to `api.qrserver.com`, sending the user's text — passwords, addresses,
+  private links — as a query parameter to an external server. Every call in a default install
+  took that path, because the package was not a dependency at all. QR codes are now generated
+  locally only; if the library is absent the tool refuses and tells you how to install it,
+  rather than quietly exfiltrating data. `qrcode[pil]` added to both dependency manifests.
+- Two tests lock this down: one asserts no external domain appears anywhere in the result
+  (verified by reintroducing the old code and watching it fail), the other asserts a real
+  `data:image/png;base64,` payload comes back.
+
+### Changed
+
+- Test suite: 979 → 981.
+
+---
+
+## [1.8.0] — 2026-11-08
+
+Any-account toolkit: tools and knowledge that do not depend on whose QQ account is logged in.
+
+### Added
+
+- **13 general-purpose tools** (`core/tools_general.py`), taking the registry from 42 to 55:
+  - Unit conversion (length / weight / volume / temperature), timestamp ↔ date,
+    Base64, hashing (md5/sha1/sha256/sha512), JSON format/minify/validate,
+    regex testing, random draw, password generation, colour format conversion.
+  - Weather, translation and currency conversion — the three that need the network,
+    each with an honest failure message instead of a silent empty answer.
+  - Currency conversion tries three providers in order, because single free FX sources
+    are unreliable (frankfurter.app returned a 301 that httpx does not follow by default).
+- **Rule routing for the offline case.** Without a model key, 「5km 换算成英里」、
+  「时间戳 1730000000 是几号」、`base64 编码 …`、`sha256 …`、`json 格式化 …` still reach
+  the right tool. General routing runs *before* QQ platform actions — otherwise a question
+  containing 戳 was captured by `qq_poke`.
+- **7 general knowledge entries** (`GEN001`–`GEN007`): time/date conventions, unit conversion
+  facts, file & encoding basics, privacy red lines, how to say "I don't know", common office
+  workflows, and debugging order. Knowledge base: 14 → 21 entries.
+- `core/tool_result.py` — result-contract helpers extracted so `tools` and `tools_general`
+  no longer import each other in a cycle.
+
+### Fixed
+
+- **`tool_color("#0E5C55")` returned `#000537`.** The branch test looked at how many digits
+  it could extract, and hex letters are not digits — `0E5C55` yielded `['0','5','55']`,
+  was misread as RGB and re-emitted as a different colour. Now the input *form*
+  (comma/parentheses vs bare hex) decides the branch.
+- **`empty_result` contract regression.** While extracting helpers, `status="empty"` was
+  briefly replaced by `empty=True`; three tests caught it immediately because the pipeline
+  branches on `status` and would have turned "you have no reminders" into an escalation ticket.
+
+### Changed
+
+- `AUTHORIZED_QQ` cleared in this deployment: no account holds privileged tool access by
+  default. Set it explicitly after scanning the account you actually want to own the bot.
+
+### Known limitation
+
+- Emote library: 300 of 1289 files carry visual tags. `index.json` is a 300-entry ring
+  (oldest evicted) by design, so tagging stops there; the remaining files are historical
+  and not currently served.
+
+---
+
+## [1.7.1] — 2026-11-08
+
+QQ account identity: it now follows whoever actually logged in, with no default account baked in.
+
+### Fixed
+
+- **A hardcoded QQ number acted as the default identity.** `scripts/launcher.py` fell back to a
+  specific account when its config file was missing, so after switching accounts the launcher
+  would quick-login the *old* number while the user was scanning a new one. The default is now an
+  empty string, and starting the protocol side with an empty number is refused with a clear
+  message instead of silently reusing cached credentials.
+- **Account details had no single source of truth.** `uin` / `nick` were stitched together in the
+  frontend and could survive an account switch. New `core/qq_identity.py` stores the identity that
+  NapCat actually reported at login; `/api/channel/qq/login-status` now always returns an
+  `account` object (present even when NapCat is unreachable) and the UI renders only that.
+- **Switching accounts left stale data.** Identity sync now *replaces* rather than merges: a
+  different `uin` overwrites `nick` and avatar outright. There is no path where account A's name
+  survives into account B's session.
+- **`logged_in_at` was rewritten on every poll.** The change check compared the raw
+  `avatar_url` argument (often empty) against the derived URL, so a new timestamp was written
+  every 3 seconds and the UI could never show how long the session had been up.
+
+### Added
+
+- `tests/test_qq_identity.py` — 7 tests covering: empty identity before first login, identity
+  following the real login, switch-replaces-not-merges, stable timestamps on repeated polls,
+  empty input not clearing a known identity, the `account` shape from the API, and opt-in
+  behaviour of the authorization follow.
+- `QQ_IDENTITY_FOLLOW_LOGIN` (default off). When enabled, a successful login appends the account
+  to `AUTHORIZED_QQ`. Off by default on purpose: scanning a QR code should not silently grant
+  privileged tool access.
+
+### Changed
+
+- Test suite: 958 → 965.
+
+---
+
+## [1.7.0] — 2026-11-07
+
+Type safety done end to end, and the last persistence split.
+
+### Added
+
+- **`mypy` is now blocking across the whole codebase** — 126 pre-existing errors fixed to zero
+  across 88 files. Most were not cosmetic: annotations disagreed with what the code actually
+  does, which is exactly the class of bug that fails at runtime instead of at build time.
+- **`core/session_store.py`** — sessions, messages, visitor identity and ticket creation moved out
+  of `core/store.py` (194 lines). Same compatibility-shim pattern as `reminder_store`:
+  `store.*` keeps forwarding, so all 40 call sites are untouched.
+
+### Fixed
+
+- **Duplicate `reminder_*` definitions in `core/store.py`.** The earlier extraction left three
+  old implementations behind; they shadowed the forwarding layer, so behaviour happened to be
+  correct but the file contained two divergent copies of the same functions. Removed.
+- **`gateway/bot.py` could read `result.ok` when `result` was still `None`** — `split_reply()`
+  returning an empty list left the variable unassigned and the reply-out event then raised
+  `AttributeError`. Now guarded.
+- **`_post_ingest` was annotated `-> str` but returns and is consumed as a dict.** Corrected.
+- **`_ambient_push` / `_ambient_snapshot` were annotated as `str` but store dicts.** Corrected.
+- **`upsert_tool` claimed `-> dict` while it can return `None`.** Corrected in both the
+  implementation and the shim.
+- **`list_files` reused the `except ... as e` binding** after Python deletes it. Renamed.
+
+### Changed
+
+- `build.chunkSizeWarningLimit` raised to 600 with a comment explaining why: the 542 KB echarts
+  chunk is lazy — measured 0 echarts requests on the home page, and 8 charts rendered only after
+  navigating to `/dashboard`. A warning that fires on correct behaviour trains people to ignore
+  warnings.
+
+### Known limitation
+
+- `core/main.py` still holds 79 route handlers inside `create_app`. They share roughly 30 closure
+  variables (`app`, `hub`, `app.state.*`, config clients). Extracting them needs those
+  dependencies threaded explicitly through each router — a structural refactor with real
+  regression risk, not a mechanical move. Left as-is deliberately; the file is verified clean
+  (no duplicate handlers, no duplicate routes, 99 routes).
+
+---
+
+## [1.6.1] — 2026-11-07
+
+Correctness and tooling: two real bugs, plus the i18n work that surfaced them.
+
+### Fixed
+
+- **Reminders created through the admin API fired at the wrong hour.** `core/api/reminders.py`
+  passed `datetime.now(timezone.utc)` into `parse_due()`, overriding that function's contract
+  that "the user's 9am means local 9am". The same sentence — 「明天早上9点」 — therefore landed
+  8 hours apart depending on whether it came from the web API or from the chat tool. The call
+  now uses the local-clock default, and a regression test asserts both entry points agree to
+  within 60 seconds. This was the last P1 left over from the 1.4.0 roadmap.
+- **`list_files` reused the `except ... as e` variable after the block.** Python deletes that
+  binding when the handler exits, so the following list comprehension read a deleted name
+  (mypy flags it as `Trying to read deleted variable`; at runtime it can raise `NameError`
+  on some paths). Renamed to `item`.
+
+### Added
+
+- `scripts/i18n_wrap.py`, `scripts/i18n_gap.py`, `scripts/i18n_fill.py` — idempotent tooling to
+  wrap untranslated UI strings, detect gaps, and fill translations. Gap count is now **0**
+  (437 source msgids, 748 `en.ts` entries; was ~536 gaps).
+- Blocking `mypy` for new modules in CI (`core/api/*` with `--follow-imports=skip`). Legacy
+  modules stay advisory — 126 pre-existing errors across 16 files would be a risky
+  big-bang change, so new code simply stops adding to the debt.
+
+### Changed
+
+- `bootstrapAdminToken` aborts after 3s. It resolves before React mounts the root, so a fetch
+  that never settles left the page permanently blank with no console error.
+- Test suite: 956 → 958.
+
+---
+
+## [1.6.0] — 2026-11-06
+
+Delivery layer: the project becomes installable, shippable, and self-explanatory on first run.
+
+### Added
+
+- **`zhike` CLI** (`core/cli.py`): `init`, `run`, `doctor`, `status`, `version`. `init` creates
+  `.env`, generates 32-byte admin/channel tokens and creates the database; `run` starts the
+  server and auto-initializes on first use; `doctor` reports what is actually true (deps, tokens,
+  ports, database, frontend build, live service health) instead of making users guess.
+  Registered as `[project.scripts] zhike` and installable via `pip install -e .`.
+- **Single-file Windows exe** (`packaging/`, `scripts/build_exe.py`): 60 MB, no Python needed on
+  the target machine. `build_exe.py` verifies `/healthz`, `/readyz`, the console page, and a real
+  tool call before declaring success.
+- **`core/paths.py`**: one place that resolves read-only assets (bundled in `_MEIPASS`) versus
+  writable data (`zhike-data/` next to the exe, or `%LOCALAPPDATA%\Zhike`). Previously every
+  module computed `Path(__file__).parent` independently, which cannot survive packaging.
+- **First-run setup wizard** (`core/api/setup.py` + `SetupWizard.jsx`): four steps (welcome,
+  model, optional QQ, self-check), resumable, skippable, local-only, auto-skipped for existing
+  installations.
+- **Standalone QR login page** (`/qq-scan`): a persistent page designed to be left open — the QR
+  refreshes every 10 seconds so the displayed code is always scannable, with a visible countdown
+  and 3-second login polling.
+- **Competitive research** (`docs/research/COMPETITIVE-RESEARCH.md`): 12 comparable projects with
+  source-level evidence, including which deployment model each uses and why.
+
+### Fixed
+
+- **Admin pages hung on "Loading" forever when no token was in storage.** `baseHeaders` omitted
+  the admin header, the resulting 401 was swallowed by the loading state, and `TokenGate` — which
+  only renders on an auth *error* — never appeared. The app now resolves the local token before
+  mounting.
+- **The protocol-end downloader hardcoded a proxy at `127.0.0.1:7897`.** On any machine without
+  that proxy running, all six parallel ranges failed with `ConnectError` and the download stalled
+  with no actionable message. Proxies are now opt-in via `NAPCAT_DL_PROXY`.
+- **`zhike init` could leave two `ADMIN_TOKEN` entries in `.env`** by appending instead of filling
+  the existing empty key in place.
+- **CLI crashed on Windows GBK consoles** at the first `✓` (`UnicodeEncodeError`), which made the
+  exe fail on its very first command. Output now degrades to ASCII when UTF-8 is unavailable.
+- **`zhike status`/`doctor` misreported healthy checks as failures** (`configured` was read as a
+  boolean `ok`).
+- **`report_demo.py` clicked an element that only exists in a non-default tab** of the runs page,
+  so demo recording failed. It now switches to the action-audit view first.
+
+### Changed
+
+- Test suite: 937 → 954 backend, 12 → 16 frontend.
+- README (both languages) rewritten around a demo GIF and three commands, with the screenshots
+  moved below the fold.
+
+---
+
+## [1.5.1] — 2026-11-06
+
+Observability and offline regression hardening: the fixes here are all things that
+were silently broken rather than visibly broken.
+
+### Fixed
+
+- **500 responses lost their correlation ID.** `create_app()` registered
+  `@app.exception_handler(Exception)` twice; FastAPI keys handlers by exception class, so
+  the second registration silently replaced the first. Every unexpected error therefore
+  returned `{"detail": "服务内部错误，已记录日志"}` with no `request_id` and no
+  `X-Request-ID` header — exactly the information needed to line a user report up with the
+  server log. Now there is a single handler, and the middleware also stores the ID on
+  `request.state` because the contextvar is already reset by the time `ServerErrorMiddleware`
+  handles the exception. The body and header now agree.
+- **`logger.debug()` never reached the log ring.** `events_log.attach()` hardcoded
+  `setLevel(INFO)` on both `core` and `cs.events`, so the diagnostics worth having —
+  retrieval scores, rule-layer hits, model fallbacks — were dropped before reaching the
+  in-memory ring and `/api/admin/logs`. New `CS_AGENT_LOG_LEVEL` (default `INFO`) makes the
+  level configurable; the console's log page gained a `DEBUG` filter and per-row
+  `request_id` (click to copy).
+- **Protocol-end download could hang forever.** `napcat_fetch._download_part()` reset its
+  `idle` counter after printing "all mirrors struggling", so a download where every mirror
+  returned zero bytes never returned. `strict_download()` then blocked on `thread.join()`
+  forever: the console deploy wizard sat at "下载中…" with no error and no timeout, and the
+  only plausible user conclusion was a bad network. Consecutive zero-byte rounds are now
+  capped (`NAPCAT_DL_MAX_STALL_ROUNDS`, default 30) and the stall raises a message naming
+  the last real error. Thread exceptions are also propagated to the caller instead of
+  surfacing as a bare size mismatch.
+- **Character cards could contradict themselves.** Nothing checked that a catchphrase or a
+  reference utterance wasn't also listed as a taboo. Such a card makes the consistency guard
+  reject every normal reply, and the retry loop rewrites until it gives up. The offline
+  harness now extracts the terms actually banned by "不用「X」"-style taboos and fails on
+  overlap. Matching is deliberately narrow: a naive substring test flagged `tech`'s
+  "必须先看现象和日志" as banning its own catchphrase 日志.
+
+### Added
+
+- `scripts/harness_all.py` — single entry point for the offline regression checks
+  (version consistency, persona consistency, persona registry, guard behaviour, emote tags).
+  Five checks, a couple of seconds, no model calls, no tokens. `--list` shows what would run,
+  `--live` adds the checks that need a model or a running core.
+- CI now runs `scripts/harness_all.py` after the test suite, so persona drift and version
+  drift fail the build instead of being noticed later by hand.
+- `tests/test_version_tracing.py`, `tests/test_napcat_fetch.py` — the segmented downloader
+  (206-only, size and CRC validation, mirror rotation, stall handling) and the
+  version/tracing switches had 17%/39%/41% coverage; the three modules are now at 82%.
+
+### Changed
+
+- Test suite: 913 → 937 passing.
+
+---
+
 ## [Unreleased]
 
 ### Planned

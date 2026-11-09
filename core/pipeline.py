@@ -4,6 +4,7 @@
 """
 import asyncio
 import json
+import logging as _logging
 import random
 import re
 from dataclasses import dataclass, field
@@ -226,8 +227,12 @@ async def _prefetch_file(query: str, ctx: dict, cfg: dict) -> AgentReply | None:
             data = await llm.react(query, injected, cfg)
             if data:
                 return await _make_llm_reply(data, injected, cfg)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 降级本身合理（退回工具原文），但必须留下原因：
+            # 之前这里是 pass，模型 Key 失效/额度耗尽/超时全都无迹可查，
+            # 用户只看到"没接住"，排障只能靠猜。
+            _logging.getLogger("cs.events").warning(
+                "read_file 后置润色失败，降级为工具原文: %s: %s", type(exc).__name__, str(exc)[:200])
     return AgentReply(text=f"{path} 的内容：\n{str(res.get('note') or '')[:800]}",
                       mode="rule_react", confidence=0.7,
                       tool_used="read_file", tool_result=res)
@@ -320,8 +325,12 @@ async def _direct_tool(query: str, ctx: dict, cfg: dict) -> AgentReply | None:
                 polished.tool_result = res
                 polished.escalate = False
                 return polished
-        except Exception:
-            pass
+        except Exception as exc:
+            # 降级本身合理（退回工具原文），但必须留下原因：
+            # 之前这里是 pass，模型 Key 失效/额度耗尽/超时全都无迹可查，
+            # 用户只看到"没接住"，排障只能靠猜。
+            _logging.getLogger("cs.events").warning(
+                "工具结果润色失败，降级为工具原文: %s: %s", type(exc).__name__, str(exc)[:200])
     return reply
 
 
@@ -372,8 +381,12 @@ async def _prefetch_url(query: str, ctx: dict, cfg: dict) -> AgentReply | None:
             data = await llm.react(query, injected, cfg)
             if data:
                 return await _make_llm_reply(data, injected, cfg)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 降级本身合理（退回工具原文），但必须留下原因：
+            # 之前这里是 pass，模型 Key 失效/额度耗尽/超时全都无迹可查，
+            # 用户只看到"没接住"，排障只能靠猜。
+            _logging.getLogger("cs.events").warning(
+                "read_webpage 后置润色失败，降级为工具原文: %s: %s", type(exc).__name__, str(exc)[:200])
     return AgentReply(
         text=f"{url} 的内容：\n{body[:800]}",
         mode="rule_react", confidence=0.7,
@@ -516,6 +529,7 @@ async def _llm_answer(query: str, ctx: dict, cfg: dict, image_b64: str = "",
         final = None
     forced_answer = str((final or {}).get("answer") or "").strip()
     if forced_answer and not llm.is_promise_only(forced_answer):
+        assert final is not None  # forced_answer 非空即说明 final 有内容
         final["tool"] = None
         return _with_tools(await _make_llm_reply(final, forced, cfg))
     # 连「不许再拖」都只换来一句「我这就去查」：不能再把空话发给用户。

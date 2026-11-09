@@ -32,31 +32,14 @@ from core.tool_context import EMPTY, ToolContext
 # 结果契约
 # ============================================================
 
-def ok_result(tool: str, note: str, **extra: Any) -> dict:
-    return {"tool": tool, "connected": True, "found": True, "note": note, **extra}
+# 返回结构定义已提到 core/tool_result.py（零依赖），避免 tools 与 tools_general 循环导入。
+# 这里保留同名导入，调用方与既有测试无需改动。
+from core.tool_result import empty_result, miss_result, need_ctx, off_result, ok_result  # noqa: E402,F401
 
-
-def miss_result(tool: str, note: str, **extra: Any) -> dict:
-    return {"tool": tool, "connected": True, "found": False, "note": note, **extra}
-
-
-def empty_result(tool: str, note: str, **extra: Any) -> dict:
-    """正常但为空的结果（「没有待办」「还没记过你」）。
-
-    必须与 miss_result 分开：这类答案是事实本身，不是知识库缺资料，
-    管线不能因此开升级工单——否则用户每问一次空列表就多一张票。
-    """
-    return {"tool": tool, "connected": True, "found": False, "status": "empty",
-            "note": note, **extra}
-
-
-def off_result(tool: str, note: str, **extra: Any) -> dict:
-    return {"tool": tool, "connected": False, "found": False, "note": note, **extra}
-
-
-def need_ctx(tool: str, what: str) -> dict:
-    return {"tool": tool, "connected": True, "found": False, "status": "need_context",
-            "note": f"缺少必要信息：{what}。请向用户确认后再试。"}
+# 说明：empty_result 与 miss_result 的区别（保留在此，方便调用方判断语义）
+#   empty_result = 「正常但为空」（没有待办 / 还没记过你）——是事实，不该开工单
+#   miss_result  = 「没有结果」（查不到资料）——可能触发升级
+# 两者都定义在 core/tool_result.py。
 
 
 # ============================================================
@@ -143,7 +126,10 @@ def tool_current_context(ctx: ToolContext, **_kw) -> dict:
     tail = list(ctx.history)[-8:]
     lines = []
     for m in tail:
-        role = {"visitor": "用户", "agent": "我", "operator": "真人"}.get(m.get("role"), str(m.get("role")))
+        if not isinstance(m, dict):
+            continue
+        role = {"visitor": "用户", "agent": "我", "operator": "真人"}.get(
+            str(m.get("role") or ""), str(m.get("role")))
         content = str(m.get("content") or "").replace("\n", " ")[:120]
         if content:
             lines.append(f"{role}：{content}")
@@ -386,15 +372,18 @@ async def tool_list_files(path: str, depth: str = "1", **_kw) -> dict:
 
     if not isinstance(data, dict):
         return miss_result("list_files", "执行器返回格式不对。", path=path)
-    entries = [e for e in (data.get("entries") or data.get("items") or [])
-               if isinstance(e, dict)]
+    # 变量名不要用 e：上面 except ... as e 的 e 在块结束时会被 Python 删除，
+    # 这里复用 e 会读到已删除的变量（mypy 报 "Trying to read deleted variable"，
+    # 运行时在特定路径上也会 NameError）。
+    entries = [item for item in (data.get("entries") or data.get("items") or [])
+               if isinstance(item, dict)]
     if not entries:
         return miss_result("list_files", "这个目录是空的或不存在。", path=path)
     lines = []
-    for e in entries[:60]:
-        name = e.get("name") or e.get("path") or "?"
-        kind = "目录" if e.get("is_dir") or e.get("type") == "dir" else "文件"
-        size = e.get("size")
+    for item in entries[:60]:
+        name = item.get("name") or item.get("path") or "?"
+        kind = "目录" if item.get("is_dir") or item.get("type") == "dir" else "文件"
+        size = item.get("size")
         lines.append(f"{kind} {name}" + (f" ({size}B)" if size else ""))
     return ok_result("list_files", "\n".join(lines), path=path, count=len(entries))
 
@@ -1032,6 +1021,10 @@ _SYNC_IMPLS: dict[str, Callable[..., dict]] = {
     "now": tool_now,
     "calc": tool_calc,
 }
+# 通用工具（core/tools_general.py）：与业务无关，任何账号都能用。
+# 用 update 而不是在字面量里展开，是因为 tools_general 反过来要从本模块导入
+# ok_result/miss_result —— 模块级互相导入会循环（已实际触发过）。
+# 延迟到本模块定义完再合并，两个方向都能拿到完整符号。
 
 # 异步实现
 _ASYNC_IMPLS: dict[str, Callable[..., Any]] = {
@@ -1083,6 +1076,7 @@ TOOL_META: dict[str, dict] = {
                 "args": {"text": "string", "target": "string"}},
     "now": {"name": "看时间", "desc": "查当前日期、时间和星期（模型自己不知道今天几号）",
             "args": {}},
+
     "calc": {"name": "算数", "desc": "计算数学表达式（加减乘除、取余、乘方、括号）",
              "args": {"expression": "string"}},
     "send_image": {"name": "发图片", "desc": "把一张图片发到当前会话（链接 / 本地路径 / data URL）",
@@ -1138,6 +1132,28 @@ def _authorize_tool(name: str, ctx: ToolContext) -> dict | None:
     except Exception:  # 审计写失败不能改变拒绝结论
         pass
     return miss_result(name, "这个操作需要管理员权限，当前身份不能执行。")
+
+
+# ---- 通用工具合并（延迟到这里，避开 tools 与 tools_general 的循环导入）----
+def _merge_general_tools() -> None:
+    """把 core/tools_general.py 的工具并入注册表。
+
+    放在模块末尾执行：tools_general 需要从本模块导入 ok_result/miss_result，
+    如果在文件开头合并，两边都处于 partially initialized 状态。
+    """
+    from typing import cast
+
+    from core import tools_general as g
+
+    # tools_general 里的函数签名带具体参数（value/from_unit/...），而注册表声明的是
+    # Callable[..., dict] 这种宽签名。运行时完全兼容（都通过 **_kw 收参），
+    # 但 mypy 的协变检查不接受，显式 cast 表达"这里是有意放宽"。
+    _SYNC_IMPLS.update(cast(dict, g.SYNC_TOOLS))
+    _ASYNC_IMPLS.update(cast(dict, g.ASYNC_TOOLS))
+    TOOL_META.update(g.TOOL_META_EXTRA)
+
+
+_merge_general_tools()
 
 
 def _builtin_impls() -> dict:
@@ -1381,6 +1397,57 @@ def _split_memory_pair(pair: str) -> tuple[str, str]:
     return "备注", text
 
 
+def _route_general(q: str) -> tuple[str | None, dict | None]:
+    """通用工具的规则路由（单位换算 / 时间戳 / Base64 / 哈希 / JSON）。
+
+    原则同主路由：只在"换一种说法意思会变"的边界之外命中。
+    """
+    text = (q or "").strip()
+
+    # 单位换算：「5km 转英里」「100 摄氏度等于多少华氏度」
+    #
+    # 单位必须用**固定列表**匹配，不能用 `[A-Za-z一-鿿]{1,4}` 这种宽泛区间：
+    # 宽匹配会把「等于」前的字也吞进单位（实测把「摄氏度」切成「摄氏度」+「多少华氏」），
+    # 于是查表失败、路由落空。
+    units = ("摄氏度|华氏度|开尔文|公里|千米|英里|英尺|英寸|公斤|千克|吨|磅|斤|"
+             "升|毫升|加仑|克|米|厘米|毫米|"
+             "km|cm|mm|kg|ml|lb|oz|ft|inch|mile|gal|m|g|l|t|c|f|k")
+    m = re.search(
+        rf"(\d+(?:\.\d+)?)\s*({units})\s*"
+        rf"(?:换算成|转换成|换成|转成|等于多少|等于|是多少|to|→|->)\s*"
+        rf"(?:多少\s*)?({units})", text, re.I)
+    if m:
+        return "convert_unit", {"value": m.group(1), "from_unit": m.group(2),
+                                "to_unit": m.group(3)}
+
+    # 时间戳：「1730000000 是几号」「时间戳 1730000000」
+    m = re.search(r"(1\d{9}|1\d{12})", text)
+    if m and any(w in text for w in ("时间戳", "timestamp", "几号", "什么时候", "哪天")):
+        return "timestamp", {"value": m.group(1), "action": "to_date"}
+    if "现在时间戳" in text or "当前时间戳" in text:
+        return "timestamp", {"action": "now", "value": ""}
+
+    # Base64
+    if re.match(r"^(base64|b64)\s*(编码|加密|encode)", text, re.I):
+        body = re.sub(r"^(base64|b64)\s*(编码|加密|encode)\s*[:：]?\s*", "", text, flags=re.I)
+        return "base64", {"text": body, "action": "encode"}
+    if re.match(r"^(base64|b64)\s*(解码|解析|decode)", text, re.I):
+        body = re.sub(r"^(base64|b64)\s*(解码|解析|decode)\s*[:：]?\s*", "", text, flags=re.I)
+        return "base64", {"text": body, "action": "decode"}
+
+    # 哈希
+    m = re.match(r"^(md5|sha1|sha256|sha512)\s*[:：]?\s*(.+)$", text, re.I)
+    if m:
+        return "hash", {"text": m.group(2).strip(), "algorithm": m.group(1).lower()}
+
+    # JSON
+    if re.match(r"^(json)\s*(格式化|美化|校验|压缩|format)", text, re.I):
+        body = re.sub(r"^json\s*(格式化|美化|校验|压缩|format)\s*[:：]?\s*", "", text, flags=re.I)
+        return "json_format", {"text": body, "action": "format"}
+
+    return None, None
+
+
 def detect_tool(query: str, tools: dict | None = None) -> tuple[str | None, dict | None]:
     """规则路由：只处理高置信度的确定性问法。
 
@@ -1392,6 +1459,14 @@ def detect_tool(query: str, tools: dict | None = None) -> tuple[str | None, dict
     q = query or ""
     # 中文数字归一化：只用于识别时间/算式，命中后再映射回原句。
     q_num, q_spans = _cn_num_with_spans(q)
+
+    # ---- 通用工具优先匹配 ----
+    # 必须放在 QQ 平台动作之前：「时间戳 1730000000 是几号」里含"戳"字，
+    # 会被 qq_poke 的「戳一戳」规则抢先命中（已实测）。通用工具的触发词
+    # 更具体（单位/编码/哈希），先匹配不会误伤平台动作。
+    _gen = _route_general(q)
+    if _gen[0]:
+        return _gen
 
     # 提醒意图：先把时间片段剥出来，剩下的就是提醒内容。
     # 注意「明天早上八点提醒我开会」这种时间在前、提醒在中间的说法：
@@ -1457,15 +1532,25 @@ def detect_tool(query: str, tools: dict | None = None) -> tuple[str | None, dict
         norm = (q_num.replace("乘以", "*").replace("乘", "*").replace("除以", "/")
                 .replace("加", "+").replace("减", "-"))
         has_cn_op = bool(re.search(r"(乘|除以|加|减)", q))
-        # 有中文运算符时必须先看 norm：否则「等于多少」那条会把尾部裸数字先吃掉
+        # 「帮我算 1+1」「帮我算下 1+1」「求 1+1」是比「算一下」更口语的说法，
+        # 之前只收了「算一下/算算/计算」，这三种全部漏掉——无 Key 的规则模式下
+        # 用户问一句最简单的加法也会掉进「没接住」。
+        #
+        # 触发词必须是独立的词，不能是别的词里的一颗字：「预算 5000-8000 之间选哪个」
+        # 里的「算」属于「预算」，不是让我计算。所以要求「算/求」前面是句首或
+        # 非中文（空格/标点/客套词），否则整句跳过。
+        _calc_trigger = re.search(
+            r"(?:^|[^\u4e00-\u9fff])(?:帮我|给我|你)?\s*(?:算一下|算算|计算|算|求)(?:一下|下|出|算)?"
+            r"\s*[:：]?\s*([-+*/%().\d\s^×÷]+)", q)
         m = (
             (re.search(r"([\d\s+\-*/%().^]{3,})", norm) if has_cn_op else None)
-            or re.search(r"(?:算一下|算算|计算)\s*[:：]?\s*([-+*/%().\d\s^×÷]+)", q)
-            or re.search(r"([-+*/%().\d\s^×÷]+?)\s*(?:等于多少|等于几|=)", q)
+            or _calc_trigger
+            or re.search(r"([-+*/%().\d\s^×÷]+?)\s*(?:等于多少|等于几|是多少|=)", q)
         )
         expr = m.group(1).strip() if m else ""
         if not expr and re.fullmatch(r"[\d\s+\-*/%().^×÷]+", q) and re.search(r"[\d]", q):
             expr = q.strip()
+        # 算式里必须有运算符，且不能带中文标签（「5000-8000 之间选哪个」是区间不是算式）
         if expr and re.search(r"[-+*/%^×÷]", expr):
             return "calc", {"expression": expr}
 

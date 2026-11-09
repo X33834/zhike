@@ -46,7 +46,8 @@ def _parse_kb_blocks(raw: str) -> list[tuple[str, str]]:
     lines = raw.split("\n")
     blocks: list[tuple[str, str]] = []
     if any(ln.lstrip().startswith(("## ", "### ")) for ln in lines):
-        title, body = None, []
+        title: str | None = None
+        body: list[str] = []
         for ln in lines:
             ls = ln.strip()
             if ls.startswith(("## ", "### ")):
@@ -206,6 +207,10 @@ def create_app() -> FastAPI:
         from core import request_id as _rid
 
         rid = _rid.set_request_id(request.headers.get("X-Request-ID"))
+        # contextvar 在异常穿透到最外层 ServerErrorMiddleware 时已被重置
+        # （用户中间件先退出），而 request.state 的生命周期覆盖整个请求，
+        # 两者都记一份：日志仍走 contextvar，500 响应头走 state。
+        request.state.request_id = rid
         started = _time.perf_counter()
         _metrics.IN_FLIGHT.inc()
         try:
@@ -224,16 +229,22 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _unhandled_exc(request: Request, exc: Exception):
-        """未捕获异常统一出口：日志带 request_id，响应不回显堆栈（防信息泄露）。"""
+        """未捕获异常统一出口：日志带 request_id，响应不回显堆栈（防信息泄露）。
+
+        只能有一个 handler：FastAPI 的 exception_handlers 是以异常类为键的字典，
+        注册第二个会静默覆盖第一个（曾经如此，导致 500 响应既没有 request_id
+        也没有 X-Request-ID 头，现场排障时无法把报错和日志对上）。
+        """
         from core import request_id as _rid
 
-        rid = _rid.current_request_id()
+        # 优先取中间件写在 state 上的值：异常走到这里时 contextvar 已随中间件退出而失效
+        rid = getattr(request.state, "request_id", "") or _rid.current_request_id()
         ev.error("unhandled %s %s rid=%s: %s: %s", request.method, request.url.path,
                  rid, type(exc).__name__, str(exc)[:300])
         return JSONResponse(
             status_code=500,
             content={"detail": "服务内部错误", "request_id": rid},
-            headers={"X-Request-ID": rid},
+            headers={"X-Request-ID": rid} if rid else None,
         )
 
     @app.get("/metrics", include_in_schema=False)
@@ -331,16 +342,6 @@ def create_app() -> FastAPI:
         gateway: str
         status: str = "online"
         detail: dict = {}
-
-    @app.exception_handler(Exception)
-    async def _unhandled(request: Request, exc: Exception):
-        """兜底：任何未预料的异常都要落日志并返回结构化 JSON，而不是让客户端拿到 traceback。"""
-        ev.error("unhandled %s %s: %s: %s",
-                 request.method, request.url.path, type(exc).__name__, str(exc)[:300])
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "服务内部错误，已记录日志"},
-        )
 
     @app.get("/healthz")
     def healthz():
@@ -1345,7 +1346,7 @@ def create_app() -> FastAPI:
     @app.post("/api/tools", dependencies=[Depends(require_admin)])
     def create_tool(body: ToolIn):
         _validate_tool_args(body.args_json)
-        builtin = 1 if body.id in ("query_order", "initiate_refund", "lookup_policy") else 0
+        builtin = body.id in ("query_order", "initiate_refund", "lookup_policy")
         try:
             t = store.upsert_tool(body.id, body.name, body.desc, body.args_json, body.enabled, builtin)
         except ValueError as e:
@@ -1425,11 +1426,14 @@ def create_app() -> FastAPI:
     from core.api import qq_deploy as qq_deploy_api
     from core.api import qq_login as qq_login_api
     from core.api import reminders as reminders_api
+    from core.api import setup as setup_api
 
     app.include_router(kb_api.router)
     app.include_router(qq_deploy_api.router)
     app.include_router(qq_login_api.router)
     app.include_router(reminders_api.router)
+    # 首次启动向导：只对回环开放，老实例自动豁免（见 core/api/setup.py）
+    app.include_router(setup_api.router)
 
     @app.get("/api/admin/overview", dependencies=[Depends(require_admin)])
     def admin_overview():
@@ -1497,7 +1501,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/admin/channels", dependencies=[Depends(require_admin)])
     def admin_channels():
-        channels = [{"channel": "webchat", "status": "builtin", "last_seen": None, "detail": {}}]
+        channels: list[dict] = [{"channel": "webchat", "status": "builtin", "last_seen": None, "detail": {}}]
         gateways = dict(app.state.gateway_channels)
         for name, info in sorted(gateways.items()):
             status = info.get("status", "offline")
